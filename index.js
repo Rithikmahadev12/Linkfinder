@@ -1,4 +1,4 @@
-// index.js — SMART Lightspeed Scanner
+// index.js — SMART + CDN-AWARE LIGHTSPEED SCANNER
 
 const express = require("express");
 const https = require("https");
@@ -27,7 +27,7 @@ function lightspeedCategorize(num) {
 }
 
 // ─────────────────────────────
-// LIGHTSPEED LOOKUP (SAFE + TIMEOUT)
+// LIGHTSPEED CHECK (SAFE + TIMEOUT)
 // ─────────────────────────────
 async function lightspeed(domain) {
   return new Promise((resolve) => {
@@ -80,72 +80,85 @@ async function lightspeed(domain) {
 }
 
 // ─────────────────────────────
-// MULTI-SOURCE REVERSE IP (SMARTER)
+// REVERSE IP LOOKUP
 // ─────────────────────────────
 async function reverseIPLookup(ip) {
-  const urls = [
-    `https://api.hackertarget.com/reverseiplookup/?q=${ip}`,
-    `https://api.viewdns.info/reverseip/?host=${ip}&apikey=free`
-  ];
+  return new Promise((resolve) => {
+    https.get(
+      `https://api.hackertarget.com/reverseiplookup/?q=${ip}`,
+      (res) => {
+        let data = "";
 
-  for (const url of urls) {
-    const data = await new Promise((resolve) => {
-      https.get(url, (res) => {
-        let body = "";
-        res.on("data", c => body += c);
-        res.on("end", () => resolve(body));
-      }).on("error", () => resolve(""));
-    });
+        res.on("data", chunk => data += chunk);
 
-    const domains = data
-      .split("\n")
-      .map(x => x.trim())
-      .filter(Boolean)
-      .filter(x => !x.includes("error"));
+        res.on("end", () => {
+          const domains = data
+            .split("\n")
+            .map(x => x.trim())
+            .filter(Boolean);
 
-    if (domains.length > 0) return domains;
-  }
-
-  return [ip];
+          resolve(domains.length ? domains : [ip]);
+        });
+      }
+    ).on("error", () => resolve([ip]));
+  });
 }
 
 // ─────────────────────────────
-// SMART SCANNER (FINDS 5 UNBLOCKED)
+// SMART + CDN SCANNER
 // ─────────────────────────────
-async function smartCheckIP(ip, sendProgress) {
+async function smartCheckIP(ip) {
   console.log(`\n🔍 SMART scanning IP: ${ip}`);
 
-  let seen = new Set();
   let allowedResults = [];
+  let seen = new Set();
+
+  // ─────────────────────────────
+  // CDN / STATIC TARGETS
+  // ─────────────────────────────
+  const cdnSeeds = [
+    "cdn.example.com",
+    "static.example.com",
+    "assets.example.com",
+    "jsdelivr.net",
+    "unpkg.com",
+    "cloudfront.net",
+    "akamai.net",
+    "fastly.net"
+  ];
+
+  let domains = await reverseIPLookup(ip);
+  domains = domains.slice(0, 20);
+
+  const allTargets = [...domains, ...cdnSeeds];
+
   let attempts = 0;
   const MAX_ATTEMPTS = 3;
 
   while (allowedResults.length < 5 && attempts < MAX_ATTEMPTS) {
     attempts++;
 
-    let domains = await reverseIPLookup(ip);
+    console.log(`🔄 Attempt ${attempts}`);
 
-    // expand pool if needed
-    domains = domains.slice(0, 20);
+    const batch = allTargets
+      .filter(d => !seen.has(d))
+      .slice(0, 25);
 
-    // filter duplicates
-    domains = domains.filter(d => !seen.has(d));
-    domains.forEach(d => seen.add(d));
+    batch.forEach(d => seen.add(d));
 
-    console.log(`🔄 Attempt ${attempts}, scanning ${domains.length} domains`);
-
-    // parallel scan (faster)
     const results = await Promise.all(
-      domains.map(async (domain) => {
+      batch.map(async (domain) => {
         const [category, allowed] = await lightspeed(domain);
 
         const result = { domain, category, allowed };
 
+        console.log(
+          `${allowed ? "✅ UNBLOCKED" : "❌ BLOCKED"} ${domain} → ${category}`
+        );
+
         if (allowed && allowedResults.length < 5) {
           allowedResults.push(result);
         }
-
-        sendProgress(result, allowedResults.length);
 
         return result;
       })
@@ -158,24 +171,22 @@ async function smartCheckIP(ip, sendProgress) {
 }
 
 // ─────────────────────────────
-// UI ROUTES
+// UI
 // ─────────────────────────────
 
 app.get("/", (req, res) => {
   res.send(`
     <html>
-    <body style="background:#0b0b0b;color:white;font-family:Arial;text-align:center;">
-      <h1>⚡ SMART Lightspeed Scanner</h1>
-      <a href="/check" style="color:lime;font-size:20px;">▶ Start Smart Scan</a>
-    </body>
+      <body style="background:#0b0b0b;color:white;font-family:Arial;text-align:center;">
+        <h1>⚡ SMART CDN Scanner</h1>
+        <a href="/check" style="color:lime;font-size:20px;">▶ Start Scan</a>
+      </body>
     </html>
   `);
 });
 
 app.get("/check", async (req, res) => {
   const ips = ["159.195.59.55", "15.204.230.233"];
-
-  res.setHeader("Content-Type", "text/html");
 
   let html = `
     <html>
@@ -189,15 +200,13 @@ app.get("/check", async (req, res) => {
       </style>
     </head>
     <body>
-    <h1>🔍 Smart Scan Running...</h1>
+    <h1>🔍 Smart CDN Scan Running...</h1>
   `;
 
   for (const ip of ips) {
     html += `<div class="ip"><h2>IP: ${ip}</h2>`;
 
-    const results = await smartCheckIP(ip, (result, count) => {
-      console.log(`Progress: ${count}/5 allowed`);
-    });
+    const results = await smartCheckIP(ip);
 
     for (const r of results) {
       html += `
@@ -214,14 +223,14 @@ app.get("/check", async (req, res) => {
     html += `</div>`;
   }
 
-  html += `<h2>✅ Smart Scan Complete</h2></body></html>`;
+  html += `<h2>✅ Scan Complete</h2></body></html>`;
 
   res.send(html);
 });
 
 // ─────────────────────────────
-// START
+// START SERVER
 // ─────────────────────────────
 app.listen(PORT, () => {
-  console.log(`⚡ SMART scanner running on port ${PORT}`);
+  console.log(`⚡ Smart CDN Scanner running on port ${PORT}`);
 });
