@@ -1,5 +1,3 @@
-// index.js — SMART + CDN-AWARE LIGHTSPEED SCANNER
-
 const express = require("express");
 const https = require("https");
 const WebSocket = require("ws");
@@ -8,26 +6,26 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 // ─────────────────────────────
-// CATEGORY SYSTEM
+// CATEGORY MAP
 // ─────────────────────────────
-const lightspeedjson = [
-  { CategoryNumber: 1, CategoryName: "Safe", Allow: 1 },
-  { CategoryNumber: 2, CategoryName: "Suspicious", Allow: 0 },
-  { CategoryNumber: 3, CategoryName: "Blocked", Allow: 0 },
-  { CategoryNumber: 0, CategoryName: "Unknown", Allow: 0 }
+const categories = [
+  { id: 1, name: "Safe", allow: true },
+  { id: 2, name: "Suspicious", allow: false },
+  { id: 3, name: "Blocked", allow: false },
+  { id: 0, name: "Unknown", allow: false }
 ];
 
-function lightspeedCategorize(num) {
-  for (const item of lightspeedjson) {
-    if (Number(item.CategoryNumber) === Number(num)) {
-      return [item.CategoryName, item.Allow === 1];
+function mapCategory(num) {
+  for (const c of categories) {
+    if (Number(c.id) === Number(num)) {
+      return [c.name, c.allow];
     }
   }
   return ["Unknown", false];
 }
 
 // ─────────────────────────────
-// LIGHTSPEED CHECK (SAFE + TIMEOUT)
+// LIGHTSPEED LOOKUP (SAFE)
 // ─────────────────────────────
 async function lightspeed(domain) {
   return new Promise((resolve) => {
@@ -63,7 +61,7 @@ async function lightspeed(domain) {
 
       try {
         const json = JSON.parse(msg.toString());
-        resolve(lightspeedCategorize(json.cat));
+        resolve(mapCategory(json.cat));
       } catch {
         resolve(["Error", false]);
       }
@@ -82,14 +80,14 @@ async function lightspeed(domain) {
 // ─────────────────────────────
 // REVERSE IP LOOKUP
 // ─────────────────────────────
-async function reverseIPLookup(ip) {
+async function reverseIP(ip) {
   return new Promise((resolve) => {
     https.get(
       `https://api.hackertarget.com/reverseiplookup/?q=${ip}`,
       (res) => {
         let data = "";
 
-        res.on("data", chunk => data += chunk);
+        res.on("data", c => data += c);
 
         res.on("end", () => {
           const domains = data
@@ -105,17 +103,11 @@ async function reverseIPLookup(ip) {
 }
 
 // ─────────────────────────────
-// SMART + CDN SCANNER
+// SCANNER CORE (STABLE + RANKED)
 // ─────────────────────────────
-async function smartCheckIP(ip) {
-  console.log(`\n🔍 SMART scanning IP: ${ip}`);
+async function scanIP(ip) {
+  console.log(`\n🔍 Scanning IP: ${ip}`);
 
-  let allowedResults = [];
-  let seen = new Set();
-
-  // ─────────────────────────────
-  // CDN / STATIC TARGETS
-  // ─────────────────────────────
   const cdnSeeds = [
     "cdn.example.com",
     "static.example.com",
@@ -123,69 +115,48 @@ async function smartCheckIP(ip) {
     "jsdelivr.net",
     "unpkg.com",
     "cloudfront.net",
-    "akamai.net",
-    "fastly.net"
+    "fastly.net",
+    "b-cdn.net"
   ];
 
-  let domains = await reverseIPLookup(ip);
-  domains = domains.slice(0, 20);
+  let domains = await reverseIP(ip);
 
-  const allTargets = [...domains, ...cdnSeeds];
+  const targets = [...domains.slice(0, 20), ...cdnSeeds];
 
-  let attempts = 0;
-  const MAX_ATTEMPTS = 3;
+  const results = [];
 
-  while (allowedResults.length < 5 && attempts < MAX_ATTEMPTS) {
-    attempts++;
+  for (const domain of targets) {
+    const [category, allowed] = await lightspeed(domain);
 
-    console.log(`🔄 Attempt ${attempts}`);
+    results.push({
+      domain,
+      category,
+      allowed
+    });
 
-    const batch = allTargets
-      .filter(d => !seen.has(d))
-      .slice(0, 25);
-
-    batch.forEach(d => seen.add(d));
-
-    const results = await Promise.all(
-      batch.map(async (domain) => {
-        const [category, allowed] = await lightspeed(domain);
-
-        const result = { domain, category, allowed };
-
-        console.log(
-          `${allowed ? "✅ UNBLOCKED" : "❌ BLOCKED"} ${domain} → ${category}`
-        );
-
-        if (allowed && allowedResults.length < 5) {
-          allowedResults.push(result);
-        }
-
-        return result;
-      })
+    console.log(
+      `${allowed ? "✅" : "❌"} ${domain} → ${category}`
     );
-
-    if (allowedResults.length >= 5) break;
   }
 
-  return allowedResults;
+  return results;
 }
 
 // ─────────────────────────────
 // UI
 // ─────────────────────────────
-
 app.get("/", (req, res) => {
   res.send(`
     <html>
       <body style="background:#0b0b0b;color:white;font-family:Arial;text-align:center;">
-        <h1>⚡ SMART CDN Scanner</h1>
-        <a href="/check" style="color:lime;font-size:20px;">▶ Start Scan</a>
+        <h1>⚡ Network Scanner Dashboard</h1>
+        <a href="/scan" style="color:lime;font-size:20px;">▶ Start Scan</a>
       </body>
     </html>
   `);
 });
 
-app.get("/check", async (req, res) => {
+app.get("/scan", async (req, res) => {
   const ips = ["159.195.59.55", "15.204.230.233"];
 
   let html = `
@@ -197,23 +168,31 @@ app.get("/check", async (req, res) => {
         .box { margin:5px 0; padding:6px; background:#2a2a2a; border-radius:6px; }
         .ok { color:lime; }
         .bad { color:red; }
+        .unk { color:orange; }
       </style>
     </head>
     <body>
-    <h1>🔍 Smart CDN Scan Running...</h1>
+      <h1>🔍 Scan Running...</h1>
   `;
 
   for (const ip of ips) {
     html += `<div class="ip"><h2>IP: ${ip}</h2>`;
 
-    const results = await smartCheckIP(ip);
+    const results = await scanIP(ip);
 
     for (const r of results) {
+      const color =
+        r.category === "Safe"
+          ? "ok"
+          : r.category === "Unknown"
+          ? "unk"
+          : "bad";
+
       html += `
         <div class="box">
           <b>${r.domain}</b><br>
-          <span class="${r.allowed ? "ok" : "bad"}">
-            ${r.allowed ? "UNBLOCKED" : "BLOCKED"}
+          <span class="${color}">
+            ${r.allowed ? "SAFE" : "BLOCKED"}
           </span>
           → ${r.category}
         </div>
@@ -224,7 +203,6 @@ app.get("/check", async (req, res) => {
   }
 
   html += `<h2>✅ Scan Complete</h2></body></html>`;
-
   res.send(html);
 });
 
@@ -232,5 +210,5 @@ app.get("/check", async (req, res) => {
 // START SERVER
 // ─────────────────────────────
 app.listen(PORT, () => {
-  console.log(`⚡ Smart CDN Scanner running on port ${PORT}`);
+  console.log(`⚡ Scanner running on port ${PORT}`);
 });
