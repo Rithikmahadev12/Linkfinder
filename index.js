@@ -1,5 +1,6 @@
 const express = require("express");
 const https = require("https");
+const dns = require("dns").promises;
 const WebSocket = require("ws");
 
 const app = express();
@@ -12,32 +13,28 @@ app.use(express.urlencoded({ extended: true }));
 // CATEGORY MAP
 // ─────────────────────────────
 const categories = [
-  { id: 1, name: "Safe", allow: true },
+  { id: 1, name: "Safe",       allow: true  },
   { id: 2, name: "Suspicious", allow: false },
-  { id: 3, name: "Blocked", allow: false },
-  { id: 0, name: "Unknown", allow: false }
+  { id: 3, name: "Blocked",    allow: false },
+  { id: 0, name: "Unknown",    allow: false }
 ];
 
 function mapCategory(num) {
   for (const c of categories) {
-    if (Number(c.id) === Number(num)) {
-      return [c.name, c.allow];
-    }
+    if (Number(c.id) === Number(num)) return [c.name, c.allow];
   }
   return ["Unknown", false];
 }
 
 // ─────────────────────────────
-// EXTRACT HOSTNAME FROM URL OR DOMAIN
+// EXTRACT HOSTNAME
 // ─────────────────────────────
 function extractHostname(input) {
   input = input.trim();
   try {
-    // If it looks like a URL, parse it
     if (input.startsWith("http://") || input.startsWith("https://")) {
       return new URL(input).hostname;
     }
-    // Strip any path manually
     return input.split("/")[0].toLowerCase();
   } catch {
     return input.toLowerCase();
@@ -45,11 +42,26 @@ function extractHostname(input) {
 }
 
 // ─────────────────────────────
-// LIGHTSPEED LOOKUP
+// DNS RESOLVE — get real IP for domain
+// ─────────────────────────────
+async function resolveIP(domain) {
+  try {
+    const result = await dns.lookup(domain, { family: 4 });
+    return result.address;
+  } catch {
+    return "0.0.0.0";
+  }
+}
+
+// ─────────────────────────────
+// LIGHTSPEED LOOKUP (with real resolved IP)
 // ─────────────────────────────
 async function lightspeed(domain) {
-  // Always use the exact hostname, not a base domain
   const host = extractHostname(domain);
+
+  // KEY FIX: resolve the domain's actual IP so Lightspeed categorises correctly
+  const resolvedIP = await resolveIP(host);
+  console.log(`[dns] ${host} → ${resolvedIP}`);
 
   return new Promise((resolve) => {
     let done = false;
@@ -68,9 +80,9 @@ async function lightspeed(domain) {
 
     ws.on("open", () => {
       ws.send(JSON.stringify({
-        action: "dy_lookup",
-        host: host,           // ← full subdomain, e.g. ultralink4225.b-cdn.net
-        ip: "174.85.104.135",
+        action:     "dy_lookup",
+        host:       host,
+        ip:         resolvedIP,   // ← real resolved IP, not hardcoded
         customerId: "74-1082-F000",
       }));
     });
@@ -116,8 +128,7 @@ async function reverseIP(ip) {
             .split("\n")
             .map(x => x.trim())
             .filter(Boolean)
-            .filter(x => !x.toLowerCase().startsWith("error")); // ignore API error messages
-
+            .filter(x => !x.toLowerCase().startsWith("error"));
           resolve(domains.length ? domains : [ip]);
         });
       }
@@ -133,10 +144,8 @@ async function scanDomains(targets) {
   for (const raw of targets) {
     const domain = extractHostname(raw);
     if (!domain) continue;
-
     const [category, allowed] = await lightspeed(domain);
     results.push({ domain, raw, category, allowed });
-
     console.log(`${allowed ? "✅" : "❌"} ${domain} → ${category}`);
   }
   return results;
@@ -147,163 +156,213 @@ async function scanDomains(targets) {
 // ─────────────────────────────
 async function scanIP(ip) {
   console.log(`\n🔍 Scanning IP: ${ip}`);
-  let domains = await reverseIP(ip);
-  // Take up to 30 actual reverse-IP results (no generic seeds)
+  const domains = await reverseIP(ip);
   const targets = domains.slice(0, 30).map(d => extractHostname(d));
   return scanDomains(targets);
 }
 
 // ─────────────────────────────
-// RENDER RESULTS TABLE
+// RENDER RESULTS
 // ─────────────────────────────
 function renderResults(results) {
-  if (!results.length) return `<p style="color:orange">No results found.</p>`;
-
+  if (!results.length) return `<p style="color:#555">None.</p>`;
   return results.map(r => {
     const color = r.category === "Safe" ? "ok" : r.category === "Unknown" ? "unk" : "bad";
     return `
       <div class="box">
-        <b>${r.domain}</b><br>
-        <span class="${color}">${r.allowed ? "✅ SAFE" : "❌ BLOCKED"}</span>
-        → <i>${r.category}</i>
-      </div>
-    `;
+        <b>${r.domain}</b>
+        <span class="${color} tag">${r.allowed ? "✅ SAFE" : "❌ BLOCKED"} — ${r.category}</span>
+      </div>`;
   }).join("");
 }
 
 // ─────────────────────────────
-// UI / ROUTES
+// STYLES
 // ─────────────────────────────
 const pageStyles = `
   <style>
-    body { font-family: 'Courier New', monospace; background:#0b0b0b; color:white; padding:30px; max-width:900px; margin:0 auto; }
-    h1 { color:lime; letter-spacing:2px; }
-    h2 { color:#aaa; font-size:14px; }
-    .section { margin:20px 0; padding:15px; background:#1c1c1c; border-radius:10px; border:1px solid #333; }
-    .box { margin:6px 0; padding:10px; background:#2a2a2a; border-radius:6px; font-size:13px; }
-    .ok  { color:lime; font-weight:bold; }
-    .bad { color:red;  font-weight:bold; }
-    .unk { color:orange; font-weight:bold; }
-    input, textarea {
-      background:#111; color:white; border:1px solid #444; border-radius:6px;
-      padding:8px 12px; font-family:monospace; font-size:14px; width:100%; box-sizing:border-box;
+    @import url('https://fonts.googleapis.com/css2?family=Share+Tech+Mono&display=swap');
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Share Tech Mono', monospace;
+      background: #080808;
+      color: #ddd;
+      padding: 30px;
+      max-width: 860px;
+      margin: 0 auto;
     }
-    textarea { height:100px; resize:vertical; }
-    button {
-      margin-top:10px; padding:10px 24px; background:lime; color:black;
-      border:none; border-radius:6px; font-weight:bold; font-size:15px; cursor:pointer;
+    h1 { color: #00ff88; font-size: 22px; margin-bottom: 6px; }
+    nav { margin: 14px 0 24px; }
+    nav a { color: #00ff88; text-decoration: none; margin-right: 20px; font-size: 14px; }
+    nav a:hover { text-decoration: underline; }
+    .section {
+      background: #111;
+      border: 1px solid #222;
+      border-radius: 10px;
+      padding: 18px;
+      margin-bottom: 18px;
     }
-    button:hover { background:#00cc00; }
-    a { color:lime; }
-    nav { margin-bottom:30px; }
-    nav a { margin-right:20px; font-size:16px; }
+    .section h2 { font-size: 13px; color: #888; margin-bottom: 12px; letter-spacing: 1px; }
+    .box {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: #1a1a1a;
+      border-radius: 6px;
+      padding: 10px 14px;
+      margin: 6px 0;
+      font-size: 13px;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .tag { font-size: 12px; padding: 3px 10px; border-radius: 20px; background:#0f0f0f; }
+    .ok  { color: #00ff88; }
+    .bad { color: #ff4444; }
+    .unk { color: #ffaa00; }
+
+    .ip-grid { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 14px; }
+    .ip-btn {
+      flex: 1;
+      min-width: 200px;
+      background: #1a1a1a;
+      border: 2px solid #2a2a2a;
+      border-radius: 10px;
+      padding: 20px;
+      text-align: center;
+      cursor: pointer;
+      text-decoration: none;
+      color: #ddd;
+      transition: border-color 0.2s, background 0.2s;
+      display: block;
+    }
+    .ip-btn:hover { border-color: #00ff88; background: #0e1a14; }
+    .ip-btn .ip-addr { font-size: 20px; color: #00ff88; display: block; margin-bottom: 6px; }
+    .ip-btn .ip-label { font-size: 12px; color: #555; }
+
+    textarea, input[type=text] {
+      background: #111;
+      color: white;
+      border: 1px solid #333;
+      border-radius: 6px;
+      padding: 10px 14px;
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 13px;
+      width: 100%;
+    }
+    textarea { height: 120px; resize: vertical; }
+    button[type=submit] {
+      margin-top: 12px;
+      padding: 10px 28px;
+      background: #00ff88;
+      color: #080808;
+      border: none;
+      border-radius: 6px;
+      font-weight: bold;
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 14px;
+      cursor: pointer;
+    }
+    button[type=submit]:hover { background: #00cc6a; }
+    p { color: #777; font-size: 13px; line-height: 1.7; margin-bottom: 8px; }
+    code { color: #00ff88; }
   </style>
 `;
 
+// ─────────────────────────────
+// ROUTES
+// ─────────────────────────────
+
 app.get("/", (req, res) => {
-  res.send(`
-    <html><head>${pageStyles}</head><body>
-      <h1>⚡ Network Scanner</h1>
-      <nav>
-        <a href="/check">🔗 Check Domains/URLs</a>
-        <a href="/scan">📡 Scan by IP</a>
-      </nav>
-      <div class="section">
-        <p>Use <b>Check Domains/URLs</b> to test specific links (like CDN subdomains).</p>
-        <p>Use <b>Scan by IP</b> to reverse-lookup an IP and test all its domains.</p>
-      </div>
-    </body></html>
-  `);
+  res.send(`<html><head>${pageStyles}</head><body>
+    <h1>⚡ Network Scanner</h1>
+    <nav>
+      <a href="/check">🔗 Check Domains/URLs</a>
+      <a href="/scan">📡 Scan by IP</a>
+    </nav>
+    <div class="section">
+      <p>Check specific CDN subdomains/links, or pick an IP to reverse-scan all its domains.</p>
+    </div>
+  </body></html>`);
 });
 
-// ─── CHECK: specific domains/URLs ───
+// ── CHECK: specific domains/URLs ──
 app.get("/check", (req, res) => {
-  res.send(`
-    <html><head>${pageStyles}</head><body>
-      <h1>🔗 Check Domains / URLs</h1>
-      <nav><a href="/">← Home</a></nav>
-      <div class="section">
-        <p>Paste one domain or URL per line. Full subdomains work — e.g. <code>ultralink4225.b-cdn.net</code></p>
-        <form method="POST" action="/check">
-          <textarea name="domains" placeholder="ultralink4225.b-cdn.net&#10;https://example.com/page&#10;cdn.something.net"></textarea>
-          <button type="submit">▶ Check</button>
-        </form>
-      </div>
-    </body></html>
-  `);
+  res.send(`<html><head>${pageStyles}</head><body>
+    <h1>🔗 Check Domains / URLs</h1>
+    <nav><a href="/">← Home</a></nav>
+    <div class="section">
+      <p>One domain or full URL per line.</p>
+      <p>Full subdomains checked exactly — e.g. <code>ultralink4225.b-cdn.net</code></p>
+      <form method="POST" action="/check">
+        <textarea name="domains" placeholder="ultralink4225.b-cdn.net&#10;https://example.com/page&#10;cdn.something.net"></textarea>
+        <button type="submit">▶ Check</button>
+      </form>
+    </div>
+  </body></html>`);
 });
 
 app.post("/check", async (req, res) => {
   const raw = (req.body.domains || "").trim();
   const lines = raw.split("\n").map(x => x.trim()).filter(Boolean);
-
-  if (!lines.length) {
-    return res.redirect("/check");
-  }
+  if (!lines.length) return res.redirect("/check");
 
   const results = await scanDomains(lines);
-  const safe = results.filter(r => r.allowed);
+  const safe    = results.filter(r => r.allowed);
   const blocked = results.filter(r => !r.allowed);
 
-  res.send(`
-    <html><head>${pageStyles}</head><body>
-      <h1>🔗 Check Results</h1>
-      <nav><a href="/check">← Check another</a> &nbsp; <a href="/">Home</a></nav>
-
-      <div class="section">
-        <h2>✅ UNBLOCKED (${safe.length})</h2>
-        ${safe.length ? renderResults(safe) : '<p style="color:#666">None found.</p>'}
-      </div>
-
-      <div class="section">
-        <h2>❌ BLOCKED / UNKNOWN (${blocked.length})</h2>
-        ${blocked.length ? renderResults(blocked) : '<p style="color:#666">None.</p>'}
-      </div>
-    </body></html>
-  `);
+  res.send(`<html><head>${pageStyles}</head><body>
+    <h1>🔗 Results</h1>
+    <nav><a href="/check">← Check another</a> &nbsp; <a href="/">Home</a></nav>
+    <div class="section">
+      <h2>✅ UNBLOCKED (${safe.length})</h2>
+      ${renderResults(safe)}
+    </div>
+    <div class="section">
+      <h2>❌ BLOCKED / UNKNOWN (${blocked.length})</h2>
+      ${renderResults(blocked)}
+    </div>
+  </body></html>`);
 });
 
-// ─── SCAN: by IP ───
+// ── SCAN: pick from 2 IPs ──
 app.get("/scan", (req, res) => {
-  res.send(`
-    <html><head>${pageStyles}</head><body>
-      <h1>📡 Scan by IP</h1>
-      <nav><a href="/">← Home</a></nav>
-      <div class="section">
-        <p>Enter an IP to reverse-lookup and scan all associated domains.</p>
-        <form method="POST" action="/scan">
-          <input type="text" name="ip" placeholder="e.g. 159.195.59.55" />
-          <button type="submit">▶ Scan</button>
-        </form>
+  res.send(`<html><head>${pageStyles}</head><body>
+    <h1>📡 Scan by IP</h1>
+    <nav><a href="/">← Home</a></nav>
+    <div class="section">
+      <p>Choose a server to reverse-lookup and test all its domains:</p>
+      <div class="ip-grid">
+        <a class="ip-btn" href="/scan/159.195.59.55">
+          <span class="ip-addr">159.195.59.55</span>
+          <span class="ip-label">Server A</span>
+        </a>
+        <a class="ip-btn" href="/scan/15.204.230.233">
+          <span class="ip-addr">15.204.230.233</span>
+          <span class="ip-label">Server B</span>
+        </a>
       </div>
-    </body></html>
-  `);
+    </div>
+  </body></html>`);
 });
 
-app.post("/scan", async (req, res) => {
-  const ip = (req.body.ip || "").trim();
-  if (!ip) return res.redirect("/scan");
-
+app.get("/scan/:ip", async (req, res) => {
+  const ip = req.params.ip;
   const results = await scanIP(ip);
-  const safe = results.filter(r => r.allowed);
+  const safe    = results.filter(r => r.allowed);
   const blocked = results.filter(r => !r.allowed);
 
-  res.send(`
-    <html><head>${pageStyles}</head><body>
-      <h1>📡 Scan Results: ${ip}</h1>
-      <nav><a href="/scan">← Scan another</a> &nbsp; <a href="/">Home</a></nav>
-
-      <div class="section">
-        <h2>✅ UNBLOCKED (${safe.length})</h2>
-        ${safe.length ? renderResults(safe) : '<p style="color:#666">None found.</p>'}
-      </div>
-
-      <div class="section">
-        <h2>❌ BLOCKED / UNKNOWN (${blocked.length})</h2>
-        ${blocked.length ? renderResults(blocked) : '<p style="color:#666">None.</p>'}
-      </div>
-    </body></html>
-  `);
+  res.send(`<html><head>${pageStyles}</head><body>
+    <h1>📡 Results: ${ip}</h1>
+    <nav><a href="/scan">← Pick another IP</a> &nbsp; <a href="/">Home</a></nav>
+    <div class="section">
+      <h2>✅ UNBLOCKED (${safe.length})</h2>
+      ${renderResults(safe)}
+    </div>
+    <div class="section">
+      <h2>❌ BLOCKED / UNKNOWN (${blocked.length})</h2>
+      ${renderResults(blocked)}
+    </div>
+  </body></html>`);
 });
 
 // ─────────────────────────────
