@@ -1,4 +1,4 @@
-// index.js — Lightspeed IP Checker (FAST + UI + SAFE)
+// index.js — SMART Lightspeed Scanner
 
 const express = require("express");
 const https = require("https");
@@ -8,13 +8,13 @@ const app = express();
 const PORT = process.env.PORT || 10000;
 
 // ─────────────────────────────
-// CATEGORY SYSTEM (fallback)
+// CATEGORY SYSTEM
 // ─────────────────────────────
 const lightspeedjson = [
   { CategoryNumber: 1, CategoryName: "Safe", Allow: 1 },
   { CategoryNumber: 2, CategoryName: "Suspicious", Allow: 0 },
   { CategoryNumber: 3, CategoryName: "Blocked", Allow: 0 },
-  { CategoryNumber: 0, CategoryName: "Uncategorized", Allow: 0 }
+  { CategoryNumber: 0, CategoryName: "Unknown", Allow: 0 }
 ];
 
 function lightspeedCategorize(num) {
@@ -23,56 +23,55 @@ function lightspeedCategorize(num) {
       return [item.CategoryName, item.Allow === 1];
     }
   }
-  return ["Uncategorized", false];
+  return ["Unknown", false];
 }
 
 // ─────────────────────────────
 // LIGHTSPEED LOOKUP (SAFE + TIMEOUT)
 // ─────────────────────────────
-async function lightspeed(url) {
+async function lightspeed(domain) {
   return new Promise((resolve) => {
-    let finished = false;
+    let done = false;
 
     const ws = new WebSocket(
       "wss://production-gc.lsfilter.com?a=0ef9b862-b74f-4e8d-8aad-be549c5f452a&customer_id=74-1082-F000&agentType=chrome_extension&agentVersion=3.777.0&userGuid=00000000-0000-0000-0000-000000000000"
     );
 
     const timeout = setTimeout(() => {
-      if (!finished) {
-        finished = true;
+      if (!done) {
+        done = true;
         ws.terminate();
         resolve(["Timeout", false]);
       }
-    }, 8000);
+    }, 7000);
 
     ws.on("open", () => {
       ws.send(JSON.stringify({
         action: "dy_lookup",
-        host: url,
+        host: domain,
         ip: "174.85.104.135",
         customerId: "74-1082-F000",
       }));
     });
 
     ws.on("message", (msg) => {
-      if (finished) return;
-      finished = true;
+      if (done) return;
+      done = true;
 
       clearTimeout(timeout);
       ws.close();
 
       try {
         const json = JSON.parse(msg.toString());
-        const result = lightspeedCategorize(json.cat);
-        resolve(result);
+        resolve(lightspeedCategorize(json.cat));
       } catch {
         resolve(["Error", false]);
       }
     });
 
     ws.on("error", () => {
-      if (!finished) {
-        finished = true;
+      if (!done) {
+        done = true;
         clearTimeout(timeout);
         resolve(["Connection Error", false]);
       }
@@ -81,72 +80,94 @@ async function lightspeed(url) {
 }
 
 // ─────────────────────────────
-// REVERSE IP LOOKUP
+// MULTI-SOURCE REVERSE IP (SMARTER)
 // ─────────────────────────────
 async function reverseIPLookup(ip) {
-  return new Promise((resolve) => {
-    https.get(
-      `https://api.hackertarget.com/reverseiplookup/?q=${ip}`,
-      (res) => {
-        let data = "";
+  const urls = [
+    `https://api.hackertarget.com/reverseiplookup/?q=${ip}`,
+    `https://api.viewdns.info/reverseip/?host=${ip}&apikey=free`
+  ];
 
-        res.on("data", chunk => data += chunk);
+  for (const url of urls) {
+    const data = await new Promise((resolve) => {
+      https.get(url, (res) => {
+        let body = "";
+        res.on("data", c => body += c);
+        res.on("end", () => resolve(body));
+      }).on("error", () => resolve(""));
+    });
 
-        res.on("end", () => {
-          const domains = data
-            .trim()
-            .split("\n")
-            .filter(Boolean);
+    const domains = data
+      .split("\n")
+      .map(x => x.trim())
+      .filter(Boolean)
+      .filter(x => !x.includes("error"));
 
-          resolve(domains.length ? domains : [ip]);
-        });
-      }
-    ).on("error", () => resolve([ip]));
-  });
+    if (domains.length > 0) return domains;
+  }
+
+  return [ip];
 }
 
 // ─────────────────────────────
-// CHECK IP (FAST + LIMIT 5 + PARALLEL)
+// SMART SCANNER (FINDS 5 UNBLOCKED)
 // ─────────────────────────────
-async function checkIP(ip) {
-  console.log(`\n🔍 Checking IP: ${ip}`);
+async function smartCheckIP(ip, sendProgress) {
+  console.log(`\n🔍 SMART scanning IP: ${ip}`);
 
-  let domains = await reverseIPLookup(ip);
+  let seen = new Set();
+  let allowedResults = [];
+  let attempts = 0;
+  const MAX_ATTEMPTS = 3;
 
-  // LIMIT TO 5 DOMAINS
-  domains = domains.slice(0, 5);
+  while (allowedResults.length < 5 && attempts < MAX_ATTEMPTS) {
+    attempts++;
 
-  // RUN IN PARALLEL (FASTER)
-  const results = await Promise.all(
-    domains.map(async (domain) => {
-      const [category, allowed] = await lightspeed(domain);
+    let domains = await reverseIPLookup(ip);
 
-      console.log(
-        `${allowed ? "✅" : "❌"} ${domain} → ${category}`
-      );
+    // expand pool if needed
+    domains = domains.slice(0, 20);
 
-      return { domain, category, allowed };
-    })
-  );
+    // filter duplicates
+    domains = domains.filter(d => !seen.has(d));
+    domains.forEach(d => seen.add(d));
 
-  return results;
+    console.log(`🔄 Attempt ${attempts}, scanning ${domains.length} domains`);
+
+    // parallel scan (faster)
+    const results = await Promise.all(
+      domains.map(async (domain) => {
+        const [category, allowed] = await lightspeed(domain);
+
+        const result = { domain, category, allowed };
+
+        if (allowed && allowedResults.length < 5) {
+          allowedResults.push(result);
+        }
+
+        sendProgress(result, allowedResults.length);
+
+        return result;
+      })
+    );
+
+    if (allowedResults.length >= 5) break;
+  }
+
+  return allowedResults;
 }
 
 // ─────────────────────────────
-// ROUTES
+// UI ROUTES
 // ─────────────────────────────
 
 app.get("/", (req, res) => {
   res.send(`
     <html>
-      <head>
-        <title>Lightspeed Checker</title>
-      </head>
-      <body style="font-family:Arial;background:#0b0b0b;color:white;text-align:center;">
-        <h1>⚡ Lightspeed IP Checker</h1>
-        <p>Fast scan system (5 domains max per IP)</p>
-        <a href="/check" style="color:lime;font-size:20px;">▶ Start Scan</a>
-      </body>
+    <body style="background:#0b0b0b;color:white;font-family:Arial;text-align:center;">
+      <h1>⚡ SMART Lightspeed Scanner</h1>
+      <a href="/check" style="color:lime;font-size:20px;">▶ Start Smart Scan</a>
+    </body>
     </html>
   `);
 });
@@ -154,26 +175,29 @@ app.get("/", (req, res) => {
 app.get("/check", async (req, res) => {
   const ips = ["159.195.59.55", "15.204.230.233"];
 
+  res.setHeader("Content-Type", "text/html");
+
   let html = `
     <html>
     <head>
-      <title>Scan Results</title>
       <style>
         body { font-family: Arial; background:#0b0b0b; color:white; padding:20px; }
-        .ip { margin-top:20px; padding:10px; background:#1c1c1c; border-radius:10px; }
-        .box { padding:8px; margin:6px 0; background:#2a2a2a; border-radius:6px; }
+        .ip { margin:20px 0; padding:10px; background:#1c1c1c; border-radius:10px; }
+        .box { margin:5px 0; padding:6px; background:#2a2a2a; border-radius:6px; }
         .ok { color:lime; }
         .bad { color:red; }
       </style>
     </head>
     <body>
-      <h1>🔍 Scan Running...</h1>
+    <h1>🔍 Smart Scan Running...</h1>
   `;
 
   for (const ip of ips) {
     html += `<div class="ip"><h2>IP: ${ip}</h2>`;
 
-    const results = await checkIP(ip);
+    const results = await smartCheckIP(ip, (result, count) => {
+      console.log(`Progress: ${count}/5 allowed`);
+    });
 
     for (const r of results) {
       html += `
@@ -190,19 +214,14 @@ app.get("/check", async (req, res) => {
     html += `</div>`;
   }
 
-  html += `
-      <h2>✅ Scan Complete</h2>
-      <a href="/" style="color:lime;">Back</a>
-    </body>
-    </html>
-  `;
+  html += `<h2>✅ Smart Scan Complete</h2></body></html>`;
 
   res.send(html);
 });
 
 // ─────────────────────────────
-// START SERVER
+// START
 // ─────────────────────────────
 app.listen(PORT, () => {
-  console.log(`⚡ Server running on port ${PORT}`);
+  console.log(`⚡ SMART scanner running on port ${PORT}`);
 });
