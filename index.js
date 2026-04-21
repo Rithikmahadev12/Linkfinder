@@ -1,12 +1,15 @@
-// check.js  (for Render)
+// index.js — Lightspeed IP Checker (FAST + UI + SAFE)
 
-const fs = require("fs");
-const path = require("path");
-const WebSocket = require("ws");
-const https = require("https");
 const express = require("express");
+const https = require("https");
+const WebSocket = require("ws");
 
-// ✅ Fallback category system (Option 2 — no JSON file needed)
+const app = express();
+const PORT = process.env.PORT || 10000;
+
+// ─────────────────────────────
+// CATEGORY SYSTEM (fallback)
+// ─────────────────────────────
 const lightspeedjson = [
   { CategoryNumber: 1, CategoryName: "Safe", Allow: 1 },
   { CategoryNumber: 2, CategoryName: "Suspicious", Allow: 0 },
@@ -15,22 +18,32 @@ const lightspeedjson = [
 ];
 
 function lightspeedCategorize(num) {
-  for (let i = 0; i < lightspeedjson.length; i++) {
-    if (Number(lightspeedjson[i]["CategoryNumber"]) === Number(num)) {
-      return [
-        lightspeedjson[i]["CategoryName"],
-        lightspeedjson[i]["Allow"] === 1
-      ];
+  for (const item of lightspeedjson) {
+    if (Number(item.CategoryNumber) === Number(num)) {
+      return [item.CategoryName, item.Allow === 1];
     }
   }
   return ["Uncategorized", false];
 }
 
+// ─────────────────────────────
+// LIGHTSPEED LOOKUP (SAFE + TIMEOUT)
+// ─────────────────────────────
 async function lightspeed(url) {
   return new Promise((resolve) => {
+    let finished = false;
+
     const ws = new WebSocket(
       "wss://production-gc.lsfilter.com?a=0ef9b862-b74f-4e8d-8aad-be549c5f452a&customer_id=74-1082-F000&agentType=chrome_extension&agentVersion=3.777.0&userGuid=00000000-0000-0000-0000-000000000000"
     );
+
+    const timeout = setTimeout(() => {
+      if (!finished) {
+        finished = true;
+        ws.terminate();
+        resolve(["Timeout", false]);
+      }
+    }, 8000);
 
     ws.on("open", () => {
       ws.send(JSON.stringify({
@@ -42,32 +55,49 @@ async function lightspeed(url) {
     });
 
     ws.on("message", (msg) => {
+      if (finished) return;
+      finished = true;
+
+      clearTimeout(timeout);
       ws.close();
+
       try {
         const json = JSON.parse(msg.toString());
         const result = lightspeedCategorize(json.cat);
-        resolve(result || ["Uncategorized", false]);
-      } catch (e) {
+        resolve(result);
+      } catch {
         resolve(["Error", false]);
       }
     });
 
-    ws.on("error", () => resolve(["Connection Error", false]));
+    ws.on("error", () => {
+      if (!finished) {
+        finished = true;
+        clearTimeout(timeout);
+        resolve(["Connection Error", false]);
+      }
+    });
   });
 }
 
+// ─────────────────────────────
+// REVERSE IP LOOKUP
+// ─────────────────────────────
 async function reverseIPLookup(ip) {
   return new Promise((resolve) => {
     https.get(
       `https://api.hackertarget.com/reverseiplookup/?q=${ip}`,
       (res) => {
         let data = "";
+
         res.on("data", chunk => data += chunk);
+
         res.on("end", () => {
           const domains = data
             .trim()
             .split("\n")
-            .filter(line => line.trim());
+            .filter(Boolean);
+
           resolve(domains.length ? domains : [ip]);
         });
       }
@@ -75,69 +105,104 @@ async function reverseIPLookup(ip) {
   });
 }
 
+// ─────────────────────────────
+// CHECK IP (FAST + LIMIT 5 + PARALLEL)
+// ─────────────────────────────
 async function checkIP(ip) {
-  console.log(`Checking IP: ${ip}`);
-  const domains = await reverseIPLookup(ip);
-  const results = [];
+  console.log(`\n🔍 Checking IP: ${ip}`);
 
-  for (const domain of domains) {
-    try {
+  let domains = await reverseIPLookup(ip);
+
+  // LIMIT TO 5 DOMAINS
+  domains = domains.slice(0, 5);
+
+  // RUN IN PARALLEL (FASTER)
+  const results = await Promise.all(
+    domains.map(async (domain) => {
       const [category, allowed] = await lightspeed(domain);
-      results.push({ domain, category, allowed });
 
       console.log(
-        `  ${allowed ? "✅" : "❌"} ${domain} → ${category}`
+        `${allowed ? "✅" : "❌"} ${domain} → ${category}`
       );
-    } catch (err) {
-      results.push({
-        domain,
-        category: "Error",
-        allowed: false
-      });
-    }
 
-    await new Promise(r => setTimeout(r, 800));
-  }
+      return { domain, category, allowed };
+    })
+  );
 
   return results;
 }
 
 // ─────────────────────────────
-// Express Server for Render
+// ROUTES
 // ─────────────────────────────
-
-const app = express();
-const PORT = process.env.PORT || 10000;
 
 app.get("/", (req, res) => {
   res.send(`
-    <h1>Lightspeed IP Checker</h1>
-    <p><a href="/check">Click here to run the scan</a></p>
-    <p>System running without lightspeed.json (fallback mode enabled)</p>
+    <html>
+      <head>
+        <title>Lightspeed Checker</title>
+      </head>
+      <body style="font-family:Arial;background:#0b0b0b;color:white;text-align:center;">
+        <h1>⚡ Lightspeed IP Checker</h1>
+        <p>Fast scan system (5 domains max per IP)</p>
+        <a href="/check" style="color:lime;font-size:20px;">▶ Start Scan</a>
+      </body>
+    </html>
   `);
 });
 
 app.get("/check", async (req, res) => {
-  res.setHeader("Content-Type", "text/plain");
-  res.write("Starting Lightspeed scan...\n\n");
-
   const ips = ["159.195.59.55", "15.204.230.233"];
 
+  let html = `
+    <html>
+    <head>
+      <title>Scan Results</title>
+      <style>
+        body { font-family: Arial; background:#0b0b0b; color:white; padding:20px; }
+        .ip { margin-top:20px; padding:10px; background:#1c1c1c; border-radius:10px; }
+        .box { padding:8px; margin:6px 0; background:#2a2a2a; border-radius:6px; }
+        .ok { color:lime; }
+        .bad { color:red; }
+      </style>
+    </head>
+    <body>
+      <h1>🔍 Scan Running...</h1>
+  `;
+
   for (const ip of ips) {
-    res.write(`\n=== Checking IP: ${ip} ===\n`);
+    html += `<div class="ip"><h2>IP: ${ip}</h2>`;
 
     const results = await checkIP(ip);
 
-    results.forEach(r => {
-      const status = r.allowed ? "✅ UNBLOCKED" : "❌ BLOCKED";
-      res.write(`${status} | ${r.domain} → ${r.category}\n`);
-    });
+    for (const r of results) {
+      html += `
+        <div class="box">
+          <b>${r.domain}</b><br>
+          <span class="${r.allowed ? "ok" : "bad"}">
+            ${r.allowed ? "UNBLOCKED" : "BLOCKED"}
+          </span>
+          → ${r.category}
+        </div>
+      `;
+    }
+
+    html += `</div>`;
   }
 
-  res.write("\n\n✅ Scan completed!");
-  res.end();
+  html += `
+      <h2>✅ Scan Complete</h2>
+      <a href="/" style="color:lime;">Back</a>
+    </body>
+    </html>
+  `;
+
+  res.send(html);
 });
 
+// ─────────────────────────────
+// START SERVER
+// ─────────────────────────────
 app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+  console.log(`⚡ Server running on port ${PORT}`);
 });
